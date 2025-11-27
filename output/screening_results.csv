@@ -1,0 +1,2 @@
+smiles,chembl_id,predicted_aggregation_reduction,predicted_effectiveness,effectiveness_probability,toxicity_risk,toxicity_score,toxicity_alerts,top_features
+CC1NCCc2c1[nH]c1ccc(Cl)cc21,CHEMBL4803806,31.786519636787403,effective,0.5226511284383112,low,0.0,none,"morgan_237, morgan_425, morgan_747"
