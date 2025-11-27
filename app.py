@@ -6,8 +6,12 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from pathlib import Path
+import struct
 import sys
+import math
 from typing import Any, Dict, List, Tuple
+
+import plotly.graph_objects as go
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -202,6 +206,95 @@ def load_feature_library():
         except Exception:
             return None
     return None
+
+
+def _load_binary_stl(stl_path: Path) -> np.ndarray:
+    with open(stl_path, 'rb') as f:
+        header = f.read(80)
+        if len(header) < 80:
+            raise ValueError("Invalid STL header")
+        tri_count_bytes = f.read(4)
+        if len(tri_count_bytes) < 4:
+            raise ValueError("Invalid STL triangle count")
+        tri_count = struct.unpack('<I', tri_count_bytes)[0]
+        data = f.read()
+    
+    expected = tri_count * 50
+    if len(data) < expected:
+        raise ValueError("STL file truncated")
+    
+    dtype = np.dtype([
+        ('normal', '<f4', (3,)),
+        ('vertices', '<f4', (3, 3)),
+        ('attr', '<u2')
+    ])
+    records = np.frombuffer(data[:expected], dtype=dtype)
+    return records['vertices'].reshape(-1, 3)
+
+
+def _load_ascii_stl(stl_path: Path) -> np.ndarray:
+    vertices: List[List[float]] = []
+    with open(stl_path, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            line = line.strip()
+            if line.lower().startswith('vertex'):
+                parts = line.split()
+                if len(parts) == 4:
+                    vertices.append([float(parts[1]), float(parts[2]), float(parts[3])])
+    if not vertices or len(vertices) % 3 != 0:
+        raise ValueError("Failed to parse ASCII STL")
+    return np.array(vertices, dtype=np.float32)
+
+
+MAX_TRIANGLES = 15000
+
+
+@st.cache_data
+def load_hsp90_structure():
+    """Load STL mesh data for the HSP90 model."""
+    stl_path = get_data_dir() / "5XR9-ribbon-vis_NIH3D.stl"
+    if not stl_path.exists():
+        return None
+    
+    try:
+        vertices = _load_binary_stl(stl_path)
+    except Exception:
+        try:
+            vertices = _load_ascii_stl(stl_path)
+        except Exception:
+            return None
+    
+    original_triangles = len(vertices) // 3
+    triangles = vertices.reshape(-1, 3, 3)
+    
+    if len(triangles) > MAX_TRIANGLES:
+        stride = math.ceil(len(triangles) / MAX_TRIANGLES)
+        triangles = triangles[::stride]
+        vertices = triangles.reshape(-1, 3)
+    
+    centroid = vertices.mean(axis=0)
+    centered = vertices - centroid
+    distances = np.linalg.norm(centered, axis=1)
+    dist_min = distances.min()
+    dist_range = np.ptp(distances) if np.ptp(distances) != 0 else 1.0
+    distance_norm = (distances - dist_min) / dist_range
+    
+    triangle_indices = np.arange(len(vertices), dtype=int)
+    mesh_data = {
+        'x': vertices[:, 0].tolist(),
+        'y': vertices[:, 1].tolist(),
+        'z': vertices[:, 2].tolist(),
+        'i': triangle_indices[0::3].tolist(),
+        'j': triangle_indices[1::3].tolist(),
+        'k': triangle_indices[2::3].tolist(),
+        'centroid': centroid.tolist(),
+        'n_triangles': len(triangle_indices) // 3,
+        'original_triangles': original_triangles,
+        'path': str(stl_path),
+        'distance_norm': distance_norm.tolist(),
+        'vertex_count': len(vertices)
+    }
+    return mesh_data
 
 
 def build_feature_matrix(df: pd.DataFrame, feature_names: List[str]) -> pd.DataFrame:
@@ -562,7 +655,7 @@ def main():
     
     page = st.sidebar.radio(
         "Choose a section:",
-        ["🏠 Overview", "📊 Results & Visualizations", "🔬 Interactive Testing", "📈 Model Information", "📋 Screening Results"],
+        ["🏠 Overview", "📊 Results & Visualizations", "🧊 3D Structure", "🔬 Interactive Testing", "📈 Model Information", "📋 Screening Results"],
         label_visibility="collapsed"
     )
     
@@ -579,6 +672,8 @@ def main():
         show_overview()
     elif page == "📊 Results & Visualizations":
         show_visualizations()
+    elif page == "🧊 3D Structure":
+        show_structure_viewer()
     elif page == "🔬 Interactive Testing":
         show_interactive_testing(reg_model, clf_model, feature_names, reg_scaler, clf_scaler)
     elif page == "📈 Model Information":
@@ -833,6 +928,209 @@ def show_visualizations():
     else:
         st.warning("Figure not found. Run the pipeline to generate it.")
 
+
+def show_structure_viewer():
+    """Interactive 3D visualization of the HSP90 ribbon model."""
+    st.markdown("""
+    <div class="modern-card fade-in" style="text-align: center;">
+        <h1 style="color: #667eea; margin: 0; font-size: 2.5rem; font-weight: 700;">
+            🧊 HSP90 3D Structure
+        </h1>
+        <p style="color: #4a5568; font-size: 1rem; line-height: 1.7; margin-top: 0.5rem;">
+            Explore the uploaded STL model of the HSP90 chaperone. Drag to rotate, scroll to zoom, and double click to reset the view.
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    mesh_data = load_hsp90_structure()
+    
+    if mesh_data is None:
+        st.warning("3D model not found or failed to load. Double-check `data/5XR9-ribbon-vis_NIH3D.stl`.")
+        return
+    
+    distance_norm = np.array(mesh_data['distance_norm'])
+    centroid = mesh_data['centroid']
+    
+    stage_definitions = [
+        {
+            'name': 'Unbound State',
+            'phase_shift': 0.0,
+            'frequency': 2.0,
+            'description': 'Domains relaxed; thermal breathing concentrated near surface loops.',
+        },
+        {
+            'name': 'Client Engagement',
+            'phase_shift': 0.8,
+            'frequency': 3.0,
+            'description': 'Pocket closure begins; ATP-lid clamps and inner cavity heats up.',
+        },
+        {
+            'name': 'Co-chaperone Docking',
+            'phase_shift': 1.6,
+            'frequency': 4.5,
+            'description': 'Simulated Hop/p23 binding concentrates strain along the equatorial domain.',
+        },
+        {
+            'name': 'Stabilized Complex',
+            'phase_shift': 2.4,
+            'frequency': 2.5,
+            'description': 'Energy dissipates; only hinge residues retain high pseudo-stress.',
+        },
+    ]
+    
+    def compute_field(distance_array: np.ndarray, phase_shift: float, frequency: float) -> np.ndarray:
+        field = (
+            0.45 * distance_array +
+            0.35 * np.sin((distance_array * frequency + phase_shift) * np.pi) +
+            0.2 * np.cos((phase_shift + distance_array * 2) * np.pi / 2)
+        )
+        field_min = field.min()
+        field_max = field.max()
+        return (field - field_min) / (field_max - field_min + 1e-9)
+    
+    stage_fields = []
+    stage_stats = []
+    for stage in stage_definitions:
+        field = compute_field(distance_norm, stage['phase_shift'], stage['frequency'])
+        hotspot_pct = float((field > 0.75).mean() * 100)
+        stage_fields.append(field)
+        stage_stats.append({
+            'name': stage['name'],
+            'peak': float(field.max()),
+            'avg': float(field.mean()),
+            'hotspot_pct': hotspot_pct,
+            'description': stage['description'],
+        })
+    
+    colorscale = 'Turbo'
+    mesh_kwargs = dict(
+        x=mesh_data['x'],
+        y=mesh_data['y'],
+        z=mesh_data['z'],
+        i=mesh_data['i'],
+        j=mesh_data['j'],
+        k=mesh_data['k'],
+        intensity=stage_fields[0],
+        colorscale=colorscale,
+        flatshading=True,
+        lighting=dict(ambient=0.7, diffuse=0.4, specular=0.3),
+        lightposition=dict(x=100, y=200, z=0),
+        opacity=0.95,
+        colorbar=dict(title='Pseudo stress', ticksuffix='', len=0.75),
+        name="HSP90 binding cycle"
+    )
+    
+    fig = go.Figure(data=[go.Mesh3d(**mesh_kwargs)])
+    
+    frames = []
+    for field, stage in zip(stage_fields, stage_definitions):
+        frame_mesh = go.Mesh3d(
+            x=mesh_data['x'],
+            y=mesh_data['y'],
+            z=mesh_data['z'],
+            i=mesh_data['i'],
+            j=mesh_data['j'],
+            k=mesh_data['k'],
+            intensity=field,
+            colorscale=colorscale,
+            flatshading=True,
+            lighting=dict(ambient=0.7, diffuse=0.4, specular=0.3),
+            lightposition=dict(x=100, y=200, z=0),
+            opacity=0.95,
+            showscale=False,
+            name=stage['name']
+        )
+        frames.append(go.Frame(data=[frame_mesh], name=stage['name']))
+    
+    fig.frames = frames
+    
+    slider_steps = []
+    for stage in stage_definitions:
+        slider_steps.append({
+            "args": [[stage['name']], {"frame": {"duration": 700, "redraw": True},
+                                       "mode": "immediate"}],
+            "label": stage['name'],
+            "method": "animate",
+        })
+    
+    fig.update_layout(
+        scene=dict(
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+            zaxis=dict(visible=False),
+            aspectmode='data',
+            dragmode='turntable',
+        ),
+        margin=dict(l=10, r=10, t=30, b=10),
+        paper_bgcolor='#f5f7fa',
+        updatemenus=[{
+            "buttons": [
+                {
+                    "args": [None, {"frame": {"duration": 700, "redraw": True}, "fromcurrent": True}],
+                    "label": "▶ Play cycle",
+                    "method": "animate",
+                },
+                {
+                    "args": [[None], {"frame": {"duration": 0, "redraw": True}, "mode": "immediate"}],
+                    "label": "⏸ Pause",
+                    "method": "animate",
+                },
+            ],
+            "direction": "left",
+            "pad": {"r": 10, "t": 30},
+            "showactive": False,
+            "type": "buttons",
+            "x": 0.1,
+            "y": 0,
+        }],
+        sliders=[{
+            "steps": slider_steps,
+            "active": 0,
+            "x": 0.15,
+            "y": -0.04,
+            "len": 0.6,
+            "pad": {"b": 10, "t": 30},
+            "currentvalue": {"prefix": "Stage: ", "visible": True, "font": {"size": 14}},
+        }]
+    )
+    
+    st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
+    
+    st.caption("This stress animation is illustrative only – it mimics a qualitative FEA-like response during the HSP90 binding cycle.")
+    
+    reduction_note = ""
+    if mesh_data.get('original_triangles'):
+        reduced = mesh_data['original_triangles'] - mesh_data['n_triangles']
+        if reduced > 0:
+            reduction_pct = 100 * reduced / mesh_data['original_triangles']
+            reduction_note = f"Mesh decimated on the fly (-{reduction_pct:.1f}% triangles) for smooth streaming."
+    
+    st.markdown(f"""
+    <div class="modern-card fade-in" style="background: #f7fafc; border-left: 4px solid #667eea;">
+        <h3 style="color: #1a202c; margin-top: 0; font-weight: 700;">Model Details</h3>
+        <ul style="color: #2d3748; line-height: 1.8; margin-bottom: 0;">
+            <li><strong>Triangles:</strong> {mesh_data['n_triangles']:,}</li>
+            <li><strong>Vertices:</strong> {mesh_data['vertex_count']:,}</li>
+            <li><strong>Centroid (Å):</strong> ({centroid[0]:.2f}, {centroid[1]:.2f}, {centroid[2]:.2f})</li>
+            <li><strong>Source file:</strong> <code>{mesh_data['path']}</code></li>
+        </ul>
+        <p style="color: #4a5568; margin-top: 1rem;">
+            Tip: Use the camera icon in the Plotly toolbar to save a snapshot for reports or presentations.{('<br>' + reduction_note) if reduction_note else ''}
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.subheader("Simulated binding cycle metrics")
+    for stats in stage_stats:
+        col1, col2, col3 = st.columns(3)
+        col1.metric(stats['name'], f"{stats['peak']:.2f}", "peak pseudo-stress")
+        col2.metric("Avg field", f"{stats['avg']:.2f}")
+        col3.metric("Hotspot (>0.75)", f"{stats['hotspot_pct']:.1f}%")
+        st.markdown(f"""
+        <div class="modern-card fade-in" style="padding: 1rem; margin-top: -1rem; margin-bottom: 1rem;">
+            <p style="color: #4a5568; margin: 0;">{stats['description']}</p>
+        </div>
+        """, unsafe_allow_html=True)
 
 def show_interactive_testing(reg_model, clf_model, feature_names, reg_scaler, clf_scaler):
     """Show interactive testing interface that relies on precomputed descriptors."""

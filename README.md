@@ -144,6 +144,7 @@ streamlit run app.py
 
 The Streamlit interface provides:
 - 📊 **Visualizations** - All plots and figures
+- 🧊 **3D Structure** - Interactive Plotly viewer for the uploaded HSP90 STL model
 - 🔬 **Interactive Testing** - Upload descriptor CSVs that were precomputed locally
 - 📈 **Model Information** - Detailed model descriptions
 - 📋 **Screening Results** - View and filter screened compounds

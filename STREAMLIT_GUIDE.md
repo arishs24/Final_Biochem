@@ -23,7 +23,7 @@
 
 ## Features
 
-The Streamlit interface includes 5 main sections:
+The Streamlit interface includes 6 main sections:
 
 ### 🏠 Overview
 - Project introduction and background
@@ -36,6 +36,11 @@ The Streamlit interface includes 5 main sections:
 - **ROC Curves** - Shows drug detection performance
 - **Feature Importance** - Shows which molecular properties matter most
 - **Correlation Heatmap** - Shows relationships between features
+
+### 🧊 3D Structure
+- Plotly-based STL viewer for the uploaded HSP90 model (`data/5XR9-ribbon-vis_NIH3D.stl`)
+- Drag to rotate, scroll to zoom, double-click to reset the camera
+- Displays triangle count, centroid coordinates, and the source path
 
 ### 🔬 Interactive Testing
 - **Upload descriptor CSVs**
@@ -67,10 +72,9 @@ The Streamlit interface includes 5 main sections:
    ```
    This generates the models and figures needed by the app.
 
-2. **For interactive testing**, you can:
-   - Type SMILES manually
-   - Select from example SMILES
-   - Test multiple compounds by running predictions multiple times
+2. **3D viewer tips**:
+   - Use the Plotly toolbar (top-right) to switch between orthographic/perspective views
+   - Click the camera icon to save PNG snapshots for slides or lab notes
 
 3. **Interactive testing workflow**:
    - Collect SMILES in a CSV (e.g., `data/raw/custom_smiles.csv`)
