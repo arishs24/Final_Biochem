@@ -10,7 +10,7 @@ This project implements a simplified machine learning pipeline to predict which 
 
 - **HSP90** is a molecular chaperone that plays a crucial role in protein folding and stability. It has been implicated in neurodegenerative diseases, including Parkinson's disease.
 
-- **PINK1** (PTEN-induced kinase 1) is a mitochondrial kinase involved in mitochondrial quality control. Mutations in PINK1 are associated with early-onset Parkinson's disease. PINK1 activation can protect against α-synuclein aggregation.
+- **PINK1** (PTEN-induced kinase 1) is a mitochondrial kinase involved in mitochondrial quality control. Mutations in PINK1 are associated with early-onset Parkinson's disease. PINK1 activation can protect against α-synuclein aggregation
 
 - **α-Synuclein** is a presynaptic protein that aggregates into toxic fibrils in Parkinson's disease. The aggregation process is a hallmark of the disease pathology.
 
