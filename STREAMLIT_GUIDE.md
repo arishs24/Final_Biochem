@@ -2,9 +2,9 @@
 
 ## Quick Start
 
-1. **Install Streamlit** (if not already installed):
+1. **Install Streamlit dependencies** (descriptor-only environment):
    ```bash
-   pip install streamlit
+   pip install -r requirements.txt
    ```
 
 2. **Run the Streamlit app**:
@@ -13,6 +13,13 @@
    ```
 
 3. **Open your browser** - Streamlit will automatically open at `http://localhost:8501`
+
+4. **(Optional) Precompute descriptor files locally** – to test new compounds you must first run:
+   ```bash
+   # Run this locally with RDKit installed
+   python scripts/precompute_descriptors.py --input data/raw/custom_smiles.csv
+   ```
+   Upload the resulting CSV on the "Interactive Testing" page.
 
 ## Features
 
@@ -31,14 +38,14 @@ The Streamlit interface includes 5 main sections:
 - **Correlation Heatmap** - Shows relationships between features
 
 ### 🔬 Interactive Testing
-- **Test your own compounds!**
-- Enter SMILES strings to get predictions
+- **Upload descriptor CSVs**
+- Descriptors must be precomputed locally with RDKit using `scripts/precompute_descriptors.py`
 - See detailed results including:
   - Predicted aggregation reduction
   - Effectiveness classification
   - Confidence scores
-  - Toxicity assessment
-  - Top contributing features
+  - Toxicity assessment (if included in your upload)
+  - Top contributing features (global)
 
 ### 📈 Model Information
 - Detailed model descriptions
@@ -65,10 +72,11 @@ The Streamlit interface includes 5 main sections:
    - Select from example SMILES
    - Test multiple compounds by running predictions multiple times
 
-3. **SMILES strings** can be found on:
-   - PubChem (https://pubchem.ncbi.nlm.nih.gov/)
-   - ChEMBL (https://www.ebi.ac.uk/chembl/)
-   - Or use the example SMILES provided in the app
+3. **Interactive testing workflow**:
+   - Collect SMILES in a CSV (e.g., `data/raw/custom_smiles.csv`)
+   - Run `python scripts/precompute_descriptors.py --input your_file.csv`
+   - Upload the generated `custom_descriptors.csv` to the Streamlit app
+   - Review predictions and download the results table
 
 ## Troubleshooting
 

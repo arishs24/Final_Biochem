@@ -88,16 +88,23 @@ This project uses machine learning to:
 
 ### Prerequisites
 
-Install required dependencies:
+The project now separates the local RDKit workflow from the deployable Streamlit app:
 
-```bash
-pip install rdkit pandas numpy scikit-learn xgboost matplotlib seaborn requests beautifulsoup4 chembl-webresource-client
-```
+- **Local pipeline (with RDKit, dataset merging, descriptor generation, and screening)**  
+  ```bash
+  pip install -r requirements-local.txt
+  ```
+  RDKit wheels are not available on Streamlit Cloud, so install locally (conda works well):
+  ```bash
+  conda install -c conda-forge rdkit
+  ```
 
-**Note**: RDKit installation may require conda:
-```bash
-conda install -c conda-forge rdkit
-```
+- **Deployable Streamlit app (no RDKit, descriptors are precomputed offline)**  
+  ```bash
+  pip install -r requirements.txt
+  ```
+
+Keeping two environments prevents the cloud deployment from pulling in RDKit while still letting you run the full cheminformatics pipeline on your laptop.
 
 ### Running the Pipeline
 
@@ -110,10 +117,22 @@ python run_pipeline.py
 This will:
 1. Download datasets from the specified URLs
 2. Process and merge the data
-3. Generate molecular features
+3. Generate molecular features (locally with RDKit)
 4. Train regression and classification models
 5. Evaluate model performance
 6. Screen new compounds from ChEMBL
+
+### Precomputing descriptors for Streamlit uploads
+
+Interactive testing on Streamlit Cloud relies on descriptor files generated offline. Use the helper script to convert any CSV containing SMILES into the feature schema used during training:
+
+```bash
+python scripts/precompute_descriptors.py \
+    --input data/raw/custom_smiles.csv \
+    --output-csv data/processed/custom_descriptors.csv
+```
+
+The resulting CSV (and optional pickle) can be uploaded to the Streamlit app for inference. You can pass `--metadata-cols column_a column_b` if you want to carry additional annotations (e.g., `source`, `notes`) into the deployment file.
 
 ### Running the Streamlit Interface
 
@@ -125,7 +144,7 @@ streamlit run app.py
 
 The Streamlit interface provides:
 - 📊 **Visualizations** - All plots and figures
-- 🔬 **Interactive Testing** - Test your own SMILES strings
+- 🔬 **Interactive Testing** - Upload descriptor CSVs that were precomputed locally
 - 📈 **Model Information** - Detailed model descriptions
 - 📋 **Screening Results** - View and filter screened compounds
 - 🏠 **Overview** - Complete project explanation
@@ -143,20 +162,21 @@ hsp90_df = load_hsp90_data()
 alpha_syn_df = load_alpha_syn_data()
 
 # Feature engineering
-from src.featurize import compute_molecular_features
-features = compute_molecular_features(smiles_list)
+from src.featurize import featurize_dataset
+features = featurize_dataset(alpha_syn_df)
 
 # Model training
-from src.train import train_models
-models = train_models(features, targets)
+from src.train import train_all_models
+train_results = train_all_models(features)
 
 # Evaluation
-from src.evaluate import evaluate_models
-evaluate_models(models, X_test, y_test)
+from src.evaluate import evaluate_all_models
+evaluate_all_models(features)
 
 # Screening
-from src.screen import screen_compounds
-results = screen_compounds(smiles_list)
+from src.screen import screen_compounds, download_chembl_hsp90_inhibitors
+compounds_df = download_chembl_hsp90_inhibitors(n_compounds=50)
+screen_results = screen_compounds(compounds_df)
 ```
 
 ## Project Structure
@@ -183,17 +203,28 @@ project_root/
 
 ## Dependencies
 
+### Local pipeline (RDKit-enabled)
+
 - Python 3.10+
-- RDKit (2023.x or later)
+- RDKit 2022.09+ (conda recommended)
 - pandas >= 2.0.0
 - numpy >= 1.24.0
 - scikit-learn >= 1.3.0
-- xgboost >= 2.0.0
 - matplotlib >= 3.7.0
 - seaborn >= 0.12.0
 - requests >= 2.31.0
 - beautifulsoup4 >= 4.12.0
 - chembl-webresource-client >= 0.10.8
+
+### Streamlit deployment (descriptor-only)
+
+- Python 3.13 (Streamlit Cloud default)
+- pandas >= 2.0.0
+- numpy >= 1.24.0
+- scikit-learn >= 1.3.0
+- streamlit >= 1.28.0
+- joblib >= 1.3.0
+- scipy >= 1.11.0
 
 ## Output Files
 

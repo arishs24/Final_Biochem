@@ -7,14 +7,12 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 import sys
-import pickle
+from typing import Any, Dict, List, Tuple
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.utils import get_models_dir, get_figures_dir, get_output_dir, get_data_dir, load_pickle
-from src.featurize import featurize_compound
-from src.screen import check_toxicity_smarts
 
 # Page configuration
 st.set_page_config(
@@ -148,6 +146,20 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+SUMMARY_METADATA_COLUMNS = [
+    'compound_id',
+    'smiles',
+    'chembl_id',
+    'source',
+    'notes',
+    'pink1_ic50',
+    'pink1_activation_score',
+    'toxicity_risk',
+    'toxicity_score',
+    'toxicity_alerts',
+]
+
+
 @st.cache_data
 def load_models():
     """Load trained models and feature names."""
@@ -178,6 +190,76 @@ def load_screening_results():
     if results_file.exists():
         return pd.read_csv(results_file)
     return None
+
+
+@st.cache_data
+def load_feature_library():
+    """Load precomputed training features for demo/testing."""
+    features_path = get_data_dir("processed") / "features.pkl"
+    if features_path.exists():
+        try:
+            return load_pickle(str(features_path))
+        except Exception:
+            return None
+    return None
+
+
+def build_feature_matrix(df: pd.DataFrame, feature_names: List[str]) -> pd.DataFrame:
+    """Align arbitrary descriptor frames to the trained feature schema."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=feature_names)
+    reindexed = df.reindex(columns=feature_names)
+    numeric = reindexed.apply(pd.to_numeric, errors='coerce')
+    return numeric.fillna(0.0)
+
+
+def get_top_features(clf_model, feature_names, top_n: int = 5) -> List[str]:
+    """Return globally important features from the classification model."""
+    if hasattr(clf_model, 'coef_') and clf_model.coef_ is not None:
+        coef = clf_model.coef_[0] if clf_model.coef_.ndim > 1 else clf_model.coef_
+        indices = np.argsort(np.abs(coef))[::-1][:top_n]
+        return [feature_names[i] for i in indices]
+    return []
+
+
+def predict_from_feature_rows(rows_df: pd.DataFrame,
+                              reg_model,
+                              clf_model,
+                              feature_names: List[str],
+                              reg_scaler,
+                              clf_scaler) -> Tuple[pd.DataFrame, List[str], int]:
+    """Run inference on descriptor rows that already contain RDKit features."""
+    if rows_df is None or rows_df.empty:
+        return pd.DataFrame(), [], len(feature_names)
+    
+    missing = [feat for feat in feature_names if feat not in rows_df.columns]
+    feature_matrix = build_feature_matrix(rows_df, feature_names)
+    feature_values = feature_matrix.to_numpy(dtype=float, copy=False)
+    
+    if reg_scaler is not None:
+        X_reg = reg_scaler.transform(feature_values)
+    else:
+        X_reg = feature_values
+    
+    if clf_scaler is not None:
+        X_clf = clf_scaler.transform(feature_values)
+    else:
+        X_clf = feature_values
+    
+    reg_preds = reg_model.predict(X_reg)
+    clf_probs = clf_model.predict_proba(X_clf)
+    clf_preds = clf_model.predict(X_clf)
+    
+    summary_cols = [col for col in SUMMARY_METADATA_COLUMNS if col in rows_df.columns]
+    summary_df = rows_df.reset_index(drop=True)[summary_cols].copy() if summary_cols else pd.DataFrame(index=range(len(rows_df)))
+    summary_df['predicted_aggregation_reduction'] = reg_preds
+    summary_df['predicted_effectiveness'] = np.where(clf_preds == 1, 'effective', 'ineffective')
+    summary_df['effectiveness_probability'] = clf_probs[:, 1]
+    
+    top_features = get_top_features(clf_model, feature_names)
+    summary_df['top_features'] = [top_features] * len(summary_df)
+    
+    return summary_df, top_features, len(missing)
 
 
 def format_feature_name(feat_name):
@@ -254,77 +336,192 @@ def format_feature_name(feat_name):
     return feat_name.capitalize()
 
 
-def predict_compound(smiles, reg_model, clf_model, feature_names, reg_scaler, clf_scaler):
-    """Predict effectiveness for a single compound."""
-    try:
-        # Featurize compound
-        features = featurize_compound(smiles, use_fingerprints=True)
+def render_prediction_ui(result: Dict[str, Any]) -> None:
+    """Render the rich prediction view used across the app."""
+    if not result:
+        st.info("No prediction available.")
+        return
+    
+    prob_pct = result.get('effectiveness_probability', 0) * 100
+    toxicity_risk = result.get('toxicity_risk') or 'not provided'
+    toxicity_score = result.get('toxicity_score')
+    toxicity_alerts = result.get('toxicity_alerts') or 'not provided'
+    if isinstance(toxicity_score, float) and np.isnan(toxicity_score):
+        toxicity_score = None
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.markdown(f"""
+        <div class="modern-card fade-in" style="text-align: center;
+                    background: #f0f4ff;
+                    border-left: 4px solid #667eea;
+                    padding: 1.5rem;">
+            <p style="color: #2d3748; font-size: 0.9rem; margin-bottom: 0.5rem; font-weight: 600;">
+                Predicted Aggregation Reduction
+            </p>
+            <h2 style="color: #667eea; font-size: 2.5rem; margin: 0.5rem 0; font-weight: 700;">
+                {result.get('predicted_aggregation_reduction', 0):.1f}%
+            </h2>
+            <p style="color: #4a5568; font-size: 0.85rem; margin: 0;">
+                Expected reduction in α-synuclein aggregation
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col2:
+        effectiveness = result.get('predicted_effectiveness', 'ineffective')
+        effectiveness_color = "#48bb78" if effectiveness == 'effective' else "#f56565"
+        effectiveness_icon = "✅" if effectiveness == 'effective' else "❌"
+        bg_color = "#f0fff4" if effectiveness == 'effective' else "#fff5f5"
+        st.markdown(f"""
+        <div class="modern-card fade-in" style="text-align: center;
+                    background: {bg_color};
+                    border-left: 4px solid {effectiveness_color};
+                    padding: 1.5rem;">
+            <p style="color: #2d3748; font-size: 0.9rem; margin-bottom: 0.5rem; font-weight: 600;">
+                Effectiveness
+            </p>
+            <h2 style="color: {effectiveness_color}; font-size: 2rem; margin: 0.5rem 0; font-weight: 700;">
+                {effectiveness_icon} {effectiveness.title()}
+            </h2>
+            <p style="color: #4a5568; font-size: 0.85rem; margin: 0;">
+                Binary classification result
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col3:
+        st.markdown(f"""
+        <div class="modern-card fade-in" style="text-align: center;
+                    background: #f0f9ff;
+                    border-left: 4px solid #4facfe;
+                    padding: 1.5rem;">
+            <p style="color: #2d3748; font-size: 0.9rem; margin-bottom: 0.5rem; font-weight: 600;">
+                Confidence Score
+            </p>
+            <h2 style="color: #4facfe; font-size: 2.5rem; margin: 0.5rem 0; font-weight: 700;">
+                {prob_pct:.1f}%
+            </h2>
+            <p style="color: #4a5568; font-size: 0.85rem; margin: 0;">
+                Probability of effectiveness
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    st.markdown("---")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("""
+        <div class="modern-card fade-in" style="background: #f7fafc;
+                    border-left: 4px solid #667eea;
+                    margin-top: 1rem;">
+            <h3 style="color: #1a202c; margin-top: 0; font-weight: 700;">📋 Detailed Results</h3>
+        </div>
+        """, unsafe_allow_html=True)
         
-        if not features:
-            return None, "Invalid SMILES string"
+        smiles = result.get('smiles') or 'not provided'
+        st.markdown(f"""
+        <div class="modern-card fade-in" style="padding: 1.5rem; margin-top: 0.5rem;">
+            <p style="color: #2d3748; margin: 0.8rem 0;">
+                <strong style="color: #1a202c;">SMILES:</strong><br>
+                <code style="background: #f7fafc; color: #2d3748; padding: 0.5rem; border-radius: 6px; display: block; margin-top: 0.5rem; word-break: break-all; font-size: 0.9rem; border: 1px solid #e2e8f0;">{smiles}</code>
+            </p>
+            <p style="color: #2d3748; margin: 0.8rem 0;">
+                <strong style="color: #1a202c;">Toxicity Risk:</strong> 
+                <span style="background: {'#48bb78' if toxicity_risk == 'low' else '#ed8936' if toxicity_risk == 'medium' else '#f56565' if toxicity_risk == 'high' else '#a0aec0'}; 
+                             color: white; 
+                             padding: 0.3rem 0.8rem; 
+                             border-radius: 6px; 
+                             font-weight: 600;
+                             font-size: 0.9rem;">
+                    {toxicity_risk.upper() if isinstance(toxicity_risk, str) else toxicity_risk}
+                </span>
+            </p>
+            <p style="color: #2d3748; margin: 0.8rem 0;">
+                <strong style="color: #1a202c;">Toxicity Score:</strong> {toxicity_score if toxicity_score is not None else 'not provided'}
+            </p>
+            <p style="color: #2d3748; margin: 0.8rem 0;">
+                <strong style="color: #1a202c;">Toxicity Alerts:</strong> 
+                {toxicity_alerts if toxicity_alerts and toxicity_alerts != 'none' else 'None detected ✅'}
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col2:
+        st.markdown("""
+        <div class="modern-card fade-in" style="background: #f7fafc;
+                    border-left: 4px solid #4facfe;
+                    margin-top: 1rem;">
+            <h3 style="color: #1a202c; margin-top: 0; font-weight: 700;">🔑 Top Contributing Features</h3>
+        </div>
+        """, unsafe_allow_html=True)
         
-        # Create feature vector
-        feature_vector = []
-        for feat_name in feature_names:
-            if feat_name in features:
-                value = features[feat_name]
-                if pd.isna(value) or (isinstance(value, float) and np.isnan(value)):
-                    feature_vector.append(0.0)
-                else:
-                    feature_vector.append(float(value))
-            else:
-                feature_vector.append(0.0)
-        
-        X = np.array([feature_vector])
-        X_df = pd.DataFrame(X, columns=feature_names)
-        X_df = X_df.fillna(0.0)
-        
-        # Scale features
-        if reg_scaler is not None:
-            X_reg_scaled = reg_scaler.transform(X_df)
+        top_features = result.get('top_features') or []
+        if top_features:
+            for i, feat in enumerate(top_features, 1):
+                formatted_feat = format_feature_name(feat)
+                st.markdown(f"""
+                <div style="background: white; 
+                            padding: 1rem; 
+                            border-radius: 8px; 
+                            margin: 0.6rem 0;
+                            border-left: 4px solid #4facfe;
+                            border: 1px solid #e2e8f0;
+                            box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
+                    <span style="color: #4facfe; font-weight: 700; font-size: 1.1rem; margin-right: 0.5rem;">{i}.</span> 
+                    <span style="color: #1a202c; font-size: 1rem; font-weight: 500; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">{formatted_feat}</span>
+                </div>
+                """, unsafe_allow_html=True)
         else:
-            X_reg_scaled = X_df
-        
-        if clf_scaler is not None:
-            X_clf_scaled = clf_scaler.transform(X_df)
-        else:
-            X_clf_scaled = X_df
-        
-        # Ensure no NaN
-        X_reg_scaled = np.nan_to_num(X_reg_scaled, nan=0.0)
-        X_clf_scaled = np.nan_to_num(X_clf_scaled, nan=0.0)
-        
-        # Make predictions
-        pred_aggregation_reduction = reg_model.predict(X_reg_scaled)[0]
-        pred_proba = clf_model.predict_proba(X_clf_scaled)[0]
-        pred_effective = clf_model.predict(X_clf_scaled)[0]
-        
-        # Get top features
-        if hasattr(clf_model, 'coef_'):
-            coef = clf_model.coef_[0] if clf_model.coef_.ndim > 1 else clf_model.coef_
-            top_indices = np.argsort(np.abs(coef))[::-1][:5]
-            top_features = [feature_names[i] for i in top_indices]
-        else:
-            top_features = []
-        
-        # Check toxicity
-        toxicity = check_toxicity_smarts(smiles)
-        
-        return {
-            'smiles': smiles,
-            'predicted_aggregation_reduction': pred_aggregation_reduction,
-            'predicted_effectiveness': 'effective' if pred_effective == 1 else 'ineffective',
-            'effectiveness_probability': pred_proba[1],
-            'toxicity_risk': toxicity['toxicity_risk'],
-            'toxicity_score': toxicity['toxicity_score'],
-            'toxicity_alerts': ', '.join(toxicity['alerts']) if toxicity['alerts'] else 'none',
-            'top_features': top_features
-        }, None
-        
-    except Exception as e:
-        return None, str(e)
-
-
+            st.info("No feature importance available.")
+    
+    st.markdown("---")
+    
+    interpretation_container = st.container()
+    effectiveness = result.get('predicted_effectiveness', 'ineffective')
+    reduction = result.get('predicted_aggregation_reduction', 0.0)
+    
+    if effectiveness == 'effective':
+        interpretation_container.markdown(f"""
+        <div class="modern-card fade-in" style="background: #f0fff4;
+                    border-left: 4px solid #48bb78;
+                    margin-top: 1rem;">
+            <h3 style="color: #1a202c; margin-top: 0; font-size: 1.4rem; font-weight: 700;">💡 Interpretation</h3>
+            <p style="color: #2d3748; font-size: 1.05rem; line-height: 1.8; margin-bottom: 0.8rem;">
+                ✅ This compound is predicted to be <strong style="color: #48bb78;">effective</strong> at reducing α-synuclein aggregation.
+            </p>
+            <ul style="color: #2d3748; font-size: 1rem; line-height: 2;">
+                <li>Expected reduction: <strong>{reduction:.1f}%</strong></li>
+                <li>Confidence: <strong>{prob_pct:.1f}%</strong></li>
+                <li>Toxicity risk: <strong>{toxicity_risk.upper() if isinstance(toxicity_risk, str) else toxicity_risk}</strong></li>
+            </ul>
+            <p style="color: #2d3748; font-size: 1rem; margin-top: 1rem; font-weight: 600; padding: 1rem; background: #e6ffed; border-radius: 6px;">
+                🎉 This compound shows promise and may be worth testing experimentally!
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        interpretation_container.markdown(f"""
+        <div class="modern-card fade-in" style="background: #fff5f5;
+                    border-left: 4px solid #f56565;
+                    margin-top: 1rem;">
+            <h3 style="color: #1a202c; margin-top: 0; font-size: 1.4rem; font-weight: 700;">💡 Interpretation</h3>
+            <p style="color: #2d3748; font-size: 1.05rem; line-height: 1.8; margin-bottom: 0.8rem;">
+                ❌ This compound is predicted to be <strong style="color: #f56565;">ineffective</strong> at reducing α-synuclein aggregation.
+            </p>
+            <ul style="color: #2d3748; font-size: 1rem; line-height: 2;">
+                <li>Expected reduction: <strong>{reduction:.1f}%</strong></li>
+                <li>Confidence: <strong>{prob_pct:.1f}%</strong></li>
+                <li>Toxicity risk: <strong>{toxicity_risk.upper() if isinstance(toxicity_risk, str) else toxicity_risk}</strong></li>
+            </ul>
+            <p style="color: #2d3748; font-size: 1rem; margin-top: 1rem; font-weight: 600; padding: 1rem; background: #ffe5e5; border-radius: 6px;">
+                ⚠️ This compound may not be suitable for further development.
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
 def main():
     """Main Streamlit app."""
     
@@ -638,7 +835,7 @@ def show_visualizations():
 
 
 def show_interactive_testing(reg_model, clf_model, feature_names, reg_scaler, clf_scaler):
-    """Show interactive testing interface."""
+    """Show interactive testing interface that relies on precomputed descriptors."""
     st.markdown("""
     <div class="modern-card fade-in" style="text-align: center;">
         <h1 style="color: #667eea; margin: 0; font-size: 2.5rem; font-weight: 700;">
@@ -652,10 +849,11 @@ def show_interactive_testing(reg_model, clf_model, feature_names, reg_scaler, cl
                 border: 2px solid #667eea;
                 margin-bottom: 2rem;">
         <h2 style="color: #667eea; margin-top: 0; font-size: 1.8rem; text-align: center; font-weight: 700;">
-            🔬 Test Your Own Compounds!
+            🔬 Test Your Own Compounds (RDKit-free Deployment)
         </h2>
         <p style="color: #2d3748; font-size: 1.05rem; line-height: 1.7; text-align: center;">
-            Enter a SMILES string (chemical structure) below to get predictions for drug effectiveness.
+            Streamlit Cloud cannot run RDKit (Python 3.13). Upload descriptor files that you generated locally
+            with the provided script to make predictions here.
         </p>
         <div style="background: white; 
                     padding: 1.5rem; 
@@ -667,251 +865,128 @@ def show_interactive_testing(reg_model, clf_model, feature_names, reg_scaler, cl
                 <li>✅ Predicted aggregation reduction percentage</li>
                 <li>🎯 Effectiveness classification (effective/ineffective)</li>
                 <li>📊 Confidence score</li>
-                <li>⚠️ Toxicity risk assessment</li>
-                <li>🔑 Most important molecular features</li>
+                <li>⚠️ Optional toxicity tags (if precomputed)</li>
+                <li>🔑 Most important molecular features (global)</li>
             </ul>
         </div>
     </div>
     """, unsafe_allow_html=True)
     
-    # Example SMILES
-    example_smiles = [
-        "CC(C)OC(=O)Nc1ccc(C(=O)Nc2ccc(C(F)(F)F)cc2)cc1",
-        "COc1cc2c(cc1OC)OC(=O)C(=C2O)C(=O)Nc1ccc(C(F)(F)F)cc1",
-        "CC1=C(C(=O)Nc2ccc(C(F)(F)F)cc2)OC(=O)c2ccccc21"
-    ]
-    
-    st.subheader("Enter SMILES String")
-    
-    # Input method selection
-    input_method = st.radio(
-        "Choose input method:",
-        ["Type manually", "Select example"]
+    st.info(
+        "Need descriptors? Run `python scripts/precompute_descriptors.py --input your_smiles.csv` "
+        "locally, then upload the resulting CSV."
     )
     
-    if input_method == "Select example":
-        selected_example = st.selectbox("Choose an example:", example_smiles)
-        smiles_input = st.text_input("SMILES String:", value=selected_example)
-    else:
-        smiles_input = st.text_input("SMILES String:", placeholder="e.g., CC(C)OC(=O)Nc1ccc(C(=O)Nc2ccc(C(F)(F)F)cc2)cc1")
+    feature_library = load_feature_library()
+    tab_library, tab_upload = st.tabs(["Use training feature library", "Upload descriptor CSV"])
     
-    if st.button("🔍 Predict", type="primary"):
-        if not smiles_input:
-            st.error("Please enter a SMILES string")
+    with tab_library:
+        if feature_library is None or feature_library.empty:
+            st.warning("Local feature library not found. Run `python run_pipeline.py` locally to generate it.")
         else:
-            with st.spinner("Computing features and making predictions..."):
-                result, error = predict_compound(smiles_input, reg_model, clf_model, feature_names, reg_scaler, clf_scaler)
+            st.markdown("""
+            <div class="modern-card fade-in" style="background: #ffffff; border-left: 4px solid #667eea;">
+                <p style="color: #2d3748; font-size: 1rem; line-height: 1.7; margin: 0;">
+                    Select any compound from the training feature matrix to preview the model outputs
+                    without running RDKit inside Streamlit.
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
             
-            if error:
-                st.error(f"Error: {error}")
-            elif result:
-                st.success("✅ Prediction complete!")
+            library_df = feature_library.reset_index(drop=True)
+            option_labels = []
+            for idx, row in library_df.iterrows():
+                compound_id = row.get('compound_id', f'compound_{idx}')
+                smiles = row.get('smiles', '') or ''
+                truncated_smiles = (smiles[:60] + "...") if len(smiles) > 60 else smiles
+                option_labels.append(f"{compound_id} | {truncated_smiles}")
+            
+            selected_label = st.selectbox("Select a compound from the library", option_labels)
+            selected_index = option_labels.index(selected_label)
+            selected_rows = library_df.iloc[[selected_index]]
+            
+            if st.button("🔍 Predict selected compound", type="primary"):
+                with st.spinner("Loading precomputed descriptors..."):
+                    predictions_df, top_features, missing = predict_from_feature_rows(
+                        selected_rows, reg_model, clf_model, feature_names, reg_scaler, clf_scaler
+                    )
                 
-                # Display results with modern styling
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    st.markdown(f"""
-                    <div class="modern-card fade-in" style="text-align: center;
-                                background: #f0f4ff;
-                                border-left: 4px solid #667eea;
-                                padding: 1.5rem;">
-                        <p style="color: #2d3748; font-size: 0.9rem; margin-bottom: 0.5rem; font-weight: 600;">
-                            Predicted Aggregation Reduction
-                        </p>
-                        <h2 style="color: #667eea; font-size: 2.5rem; margin: 0.5rem 0; font-weight: 700;">
-                            {result['predicted_aggregation_reduction']:.1f}%
-                        </h2>
-                        <p style="color: #4a5568; font-size: 0.85rem; margin: 0;">
-                            Expected reduction in α-synuclein aggregation
-                        </p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                with col2:
-                    effectiveness_color = "#48bb78" if result['predicted_effectiveness'] == 'effective' else "#f56565"
-                    effectiveness_icon = "✅" if result['predicted_effectiveness'] == 'effective' else "❌"
-                    bg_color = "#f0fff4" if result['predicted_effectiveness'] == 'effective' else "#fff5f5"
-                    st.markdown(f"""
-                    <div class="modern-card fade-in" style="text-align: center;
-                                background: {bg_color};
-                                border-left: 4px solid {effectiveness_color};
-                                padding: 1.5rem;">
-                        <p style="color: #2d3748; font-size: 0.9rem; margin-bottom: 0.5rem; font-weight: 600;">
-                            Effectiveness
-                        </p>
-                        <h2 style="color: {effectiveness_color}; font-size: 2rem; margin: 0.5rem 0; font-weight: 700;">
-                            {effectiveness_icon} {result['predicted_effectiveness'].title()}
-                        </h2>
-                        <p style="color: #4a5568; font-size: 0.85rem; margin: 0;">
-                            Binary classification result
-                        </p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                with col3:
-                    prob_pct = result['effectiveness_probability'] * 100
-                    st.markdown(f"""
-                    <div class="modern-card fade-in" style="text-align: center;
-                                background: #f0f9ff;
-                                border-left: 4px solid #4facfe;
-                                padding: 1.5rem;">
-                        <p style="color: #2d3748; font-size: 0.9rem; margin-bottom: 0.5rem; font-weight: 600;">
-                            Confidence Score
-                        </p>
-                        <h2 style="color: #4facfe; font-size: 2.5rem; margin: 0.5rem 0; font-weight: 700;">
-                            {prob_pct:.1f}%
-                        </h2>
-                        <p style="color: #4a5568; font-size: 0.85rem; margin: 0;">
-                            Probability of effectiveness
-                        </p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                st.markdown("---")
-                
-                # Detailed results with modern styling
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.markdown("""
-                    <div class="modern-card fade-in" style="background: #f7fafc;
-                                border-left: 4px solid #667eea;
-                                margin-top: 1rem;">
-                        <h3 style="color: #1a202c; margin-top: 0; font-weight: 700;">📋 Detailed Results</h3>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    
-                    st.markdown(f"""
-                    <div class="modern-card fade-in" style="padding: 1.5rem; margin-top: 0.5rem;">
-                        <p style="color: #2d3748; margin: 0.8rem 0;">
-                            <strong style="color: #1a202c;">SMILES:</strong><br>
-                            <code style="background: #f7fafc; color: #2d3748; padding: 0.5rem; border-radius: 6px; display: block; margin-top: 0.5rem; word-break: break-all; font-size: 0.9rem; border: 1px solid #e2e8f0;">{result['smiles']}</code>
-                        </p>
-                        <p style="color: #2d3748; margin: 0.8rem 0;">
-                            <strong style="color: #1a202c;">Toxicity Risk:</strong> 
-                            <span style="background: {'#48bb78' if result['toxicity_risk'] == 'low' else '#ed8936' if result['toxicity_risk'] == 'medium' else '#f56565'}; 
-                                         color: white; 
-                                         padding: 0.3rem 0.8rem; 
-                                         border-radius: 6px; 
-                                         font-weight: 600;
-                                         font-size: 0.9rem;">
-                                {result['toxicity_risk'].upper()}
-                            </span>
-                        </p>
-                        <p style="color: #2d3748; margin: 0.8rem 0;">
-                            <strong style="color: #1a202c;">Toxicity Score:</strong> {result['toxicity_score']:.2f}
-                        </p>
-                        <p style="color: #2d3748; margin: 0.8rem 0;">
-                            <strong style="color: #1a202c;">Toxicity Alerts:</strong> 
-                            {result['toxicity_alerts'] if result['toxicity_alerts'] != 'none' else 'None detected ✅'}
-                        </p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                with col2:
-                    st.markdown("""
-                    <div class="modern-card fade-in" style="background: #f7fafc;
-                                border-left: 4px solid #4facfe;
-                                margin-top: 1rem;">
-                        <h3 style="color: #1a202c; margin-top: 0; font-weight: 700;">🔑 Top Contributing Features</h3>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    
-                    if result['top_features']:
-                        # Display features in a cleaner way - avoid code-like appearance
-                        for i, feat in enumerate(result['top_features'], 1):
-                            formatted_feat = format_feature_name(feat)
-                            # Use Streamlit's native markdown to avoid HTML rendering issues
-                            st.markdown(f"""
-                            <div style="background: white; 
-                                        padding: 1rem; 
-                                        border-radius: 8px; 
-                                        margin: 0.6rem 0;
-                                        border-left: 4px solid #4facfe;
-                                        border: 1px solid #e2e8f0;
-                                        box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
-                                <span style="color: #4facfe; font-weight: 700; font-size: 1.1rem; margin-right: 0.5rem;">{i}.</span> 
-                                <span style="color: #1a202c; font-size: 1rem; font-weight: 500; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">{formatted_feat}</span>
-                            </div>
-                            """, unsafe_allow_html=True)
-                    else:
-                        st.info("No feature importance available")
-                
-                # Interpretation with modern styling
-                st.markdown("---")
-                
-                if result['predicted_effectiveness'] == 'effective':
-                    st.markdown(f"""
-                    <div class="modern-card fade-in" style="background: #f0fff4;
-                                border-left: 4px solid #48bb78;
-                                margin-top: 1rem;">
-                        <h3 style="color: #1a202c; margin-top: 0; font-size: 1.4rem; font-weight: 700;">💡 Interpretation</h3>
-                        <p style="color: #2d3748; font-size: 1.05rem; line-height: 1.8; margin-bottom: 0.8rem;">
-                            ✅ This compound is predicted to be <strong style="color: #48bb78;">effective</strong> at reducing α-synuclein aggregation.
-                        </p>
-                        <ul style="color: #2d3748; font-size: 1rem; line-height: 2;">
-                            <li>Expected reduction: <strong>{result['predicted_aggregation_reduction']:.1f}%</strong></li>
-                            <li>Confidence: <strong>{prob_pct:.1f}%</strong></li>
-                            <li>Toxicity risk: <strong>{result['toxicity_risk'].upper()}</strong></li>
-                        </ul>
-                        <p style="color: #2d3748; font-size: 1rem; margin-top: 1rem; font-weight: 600; padding: 1rem; background: #e6ffed; border-radius: 6px;">
-                            🎉 This compound shows promise and may be worth testing experimentally!
-                        </p>
-                    </div>
-                    """, unsafe_allow_html=True)
+                if predictions_df.empty:
+                    st.error("No descriptors available for the selected compound.")
                 else:
-                    st.markdown(f"""
-                    <div class="modern-card fade-in" style="background: #fff5f5;
-                                border-left: 4px solid #f56565;
-                                margin-top: 1rem;">
-                        <h3 style="color: #1a202c; margin-top: 0; font-size: 1.4rem; font-weight: 700;">💡 Interpretation</h3>
-                        <p style="color: #2d3748; font-size: 1.05rem; line-height: 1.8; margin-bottom: 0.8rem;">
-                            ❌ This compound is predicted to be <strong style="color: #f56565;">ineffective</strong> at reducing α-synuclein aggregation.
-                        </p>
-                        <ul style="color: #2d3748; font-size: 1rem; line-height: 2;">
-                            <li>Expected reduction: <strong>{result['predicted_aggregation_reduction']:.1f}%</strong></li>
-                            <li>Confidence: <strong>{prob_pct:.1f}%</strong></li>
-                            <li>Toxicity risk: <strong>{result['toxicity_risk'].upper()}</strong></li>
-                        </ul>
-                        <p style="color: #2d3748; font-size: 1rem; margin-top: 1rem; font-weight: 600; padding: 1rem; background: #ffe5e5; border-radius: 6px;">
-                            ⚠️ This compound may not be suitable for further development.
-                        </p>
-                    </div>
-                    """, unsafe_allow_html=True)
+                    if missing > 0:
+                        st.warning(f"{missing} trained features were missing. "
+                                   "Rerun the local descriptor script to keep schemas in sync.")
+                    st.success("✅ Prediction complete!")
+                    render_prediction_ui(predictions_df.iloc[0].to_dict())
     
-    st.markdown("---")
-    st.markdown("""
-    <div class="modern-card fade-in" style="background: #f7fafc;
-                border-left: 4px solid #667eea;
-                margin-top: 2rem;">
-        <h3 style="color: #1a202c; margin-top: 0; font-size: 1.4rem; font-weight: 700;">📚 About SMILES</h3>
-        <p style="color: #2d3748; font-size: 1rem; line-height: 1.7;">
-            <strong>SMILES</strong> (Simplified Molecular Input Line Entry System) is a notation for describing chemical structures.
-        </p>
-        <div style="background: white; 
-                    padding: 1.5rem; 
-                    border-radius: 8px; 
-                    margin: 1rem 0;
-                    border: 1px solid #e2e8f0;">
-            <p style="color: #1a202c; font-weight: 600; margin-bottom: 0.5rem;">💡 Examples:</p>
-            <ul style="color: #2d3748; font-size: 0.95rem; line-height: 2;">
-                <li><strong>Simple molecules:</strong> 
-                    <code style="background: #f7fafc; color: #2d3748; padding: 0.3rem 0.6rem; border-radius: 4px; border: 1px solid #e2e8f0;">C</code> (methane), 
-                    <code style="background: #f7fafc; color: #2d3748; padding: 0.3rem 0.6rem; border-radius: 4px; border: 1px solid #e2e8f0;">CC</code> (ethane)
-                </li>
-                <li><strong>Complex drugs:</strong> 
-                    <code style="background: #f7fafc; color: #2d3748; padding: 0.3rem 0.6rem; border-radius: 4px; border: 1px solid #e2e8f0; font-size: 0.85rem; word-break: break-all;">CC(C)OC(=O)Nc1ccc(C(=O)Nc2ccc(C(F)(F)F)cc2)cc1</code>
-                </li>
-            </ul>
+    with tab_upload:
+        st.markdown("""
+        <div class="modern-card fade-in" style="background: #ffffff; border-left: 4px solid #4facfe;">
+            <p style="color: #2d3748; font-size: 1rem; line-height: 1.7; margin: 0;">
+                Upload descriptor CSV files produced by <code>scripts/precompute_descriptors.py</code>.
+                The file must include every feature used during training (stored in <code>models/feature_names.pkl</code>).
+            </p>
         </div>
-        <p style="color: #2d3748; font-size: 1rem;">
-            🌐 You can find SMILES strings for compounds on websites like 
-            <a href="https://pubchem.ncbi.nlm.nih.gov/" target="_blank" style="color: #667eea; font-weight: 600;">PubChem</a> or 
-            <a href="https://www.ebi.ac.uk/chembl/" target="_blank" style="color: #667eea; font-weight: 600;">ChEMBL</a>.
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
+        
+        uploaded_file = st.file_uploader("Upload descriptor CSV", type=['csv'])
+        
+        if uploaded_file is not None:
+            try:
+                uploaded_df = pd.read_csv(uploaded_file)
+            except Exception as exc:
+                st.error(f"Could not read CSV: {exc}")
+                uploaded_df = None
+            
+            if uploaded_df is not None:
+                st.success(f"Loaded {len(uploaded_df)} rows from the uploaded file.")
+                st.dataframe(uploaded_df.head(), use_container_width=True)
+                
+                if st.button("🚀 Run predictions on uploaded descriptors", type="primary"):
+                    with st.spinner("Running inference with uploaded descriptors..."):
+                        predictions_df, top_features, missing = predict_from_feature_rows(
+                            uploaded_df, reg_model, clf_model, feature_names, reg_scaler, clf_scaler
+                        )
+                    
+                    if predictions_df.empty:
+                        st.error("No valid descriptor rows found. Ensure the CSV contains the trained feature columns.")
+                    else:
+                        if missing > 0:
+                            st.warning(
+                                f"{missing} trained features were missing. "
+                                "The model filled them with 0. Ensure you used the latest descriptor script."
+                            )
+                        st.success(f"Generated predictions for {len(predictions_df)} compounds.")
+                        
+                        render_prediction_ui(predictions_df.iloc[0].to_dict())
+                        
+                        summary_cols = [
+                            col for col in [
+                                'compound_id',
+                                'smiles',
+                                'predicted_aggregation_reduction',
+                                'predicted_effectiveness',
+                                'effectiveness_probability',
+                                'toxicity_risk',
+                                'toxicity_score'
+                            ] if col in predictions_df.columns
+                        ]
+                        
+                        st.subheader("Prediction summary (downloadable)")
+                        st.dataframe(
+                            predictions_df[summary_cols],
+                            use_container_width=True,
+                            height=300
+                        )
+                        
+                        csv_data = predictions_df.to_csv(index=False)
+                        st.download_button(
+                            label="📥 Download predictions as CSV",
+                            data=csv_data,
+                            file_name="custom_predictions.csv",
+                            mime="text/csv"
+                        )
 
 
 def show_model_info(reg_model, clf_model, feature_names):
